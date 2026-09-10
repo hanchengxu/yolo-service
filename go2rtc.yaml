@@ -1,0 +1,48 @@
+############################################################
+# go2rtc 配置
+#
+# 部署位置：/etc/go2rtc/go2rtc.yaml
+#   sudo mkdir -p /etc/go2rtc
+#   sudo cp go2rtc.yaml /etc/go2rtc/go2rtc.yaml
+#   sudo vi /etc/go2rtc/go2rtc.yaml     # 填摄像头 IP / 账号 / 密码
+#
+# 管理界面：http://<Ubuntu的IP>:1984
+# 取一帧（视觉服务用）：
+#   curl -o /tmp/t.jpg "http://127.0.0.1:1984/api/frame.jpeg?src=dining"
+############################################################
+
+streams:
+  # dining 是流的名字，随便起，取帧时的 src= 要跟它一致
+  #
+  # ⚠️ 密码里如果含特殊字符必须 URL 编码，否则整条 URL 会解析错：
+  #      @ → %40      : → %3A      / → %2F      # → %23      ? → %3F
+  #    例：密码 a@b#1  →  rtsp://user:a%40b%231@192.168.1.50:554/stream1
+  #
+  # stream1 = 主码流（2K，画面大、座位 ROI 裁出来像素够，推荐）
+  # stream2 = 子码流（约 360p，座位 ROI 会太小，别用）
+  dining: 
+
+  # 可选：再加一路子码流备用（省带宽时用），名字别冲突
+  # dining_sd: rtsp://<摄像头账号>:<密码>@192.168.1.50:554/stream2
+
+api:
+  # HTTP API 与网页管理界面端口。
+  # 本机访问用 127.0.0.1:1984 最安全；
+  # 以后要让 HA 也从 go2rtc 拉流（方案 C），改成 ":1984" 对局域网开放。
+  listen: "127.0.0.1:1984"
+  # 如果想允许局域网内其他机器访问（HA 在别的机器上时），改用下面这行：
+  # listen: ":1984"
+
+rtsp:
+  # go2rtc 对外重新输出的 RTSP 端口（HA / Frigate 可连这个）
+  listen: ":8554"
+
+webrtc:
+  # WebRTC 端口（浏览器低延迟预览用）
+  listen: ":8555"
+  # 如果 HA 从别的机器连，把 candidate 改成 Ubuntu 的实际 IP
+  # candidates:
+  #   - 192.168.1.100:8555
+
+log:
+  level: info   # 排障时改成 debug 或 trace

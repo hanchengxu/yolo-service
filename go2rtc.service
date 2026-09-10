@@ -1,0 +1,29 @@
+[Unit]
+Description=go2rtc camera stream proxy
+Documentation=https://github.com/AlexxIT/go2rtc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 必须显式指定配置路径，否则 go2rtc 只在当前目录找 go2rtc.yaml
+ExecStart=/usr/local/bin/go2rtc -config /etc/go2rtc/go2rtc.yaml
+
+# 崩溃/断流自动拉起
+Restart=always
+RestartSec=5
+
+# 摄像头是网络设备，等网络真正就绪再启动
+TimeoutStartSec=30
+
+# 以 root 跑最简单（也能直接访问 /dev/dri 做硬解）。
+# 想改用普通用户：把下面的 User 改成你的用户名，并确保其能访问 /dev/dri：
+#   sudo usermod -aG render,video 你的用户名
+User=root
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=go2rtc
+
+[Install]
+WantedBy=multi-user.target
