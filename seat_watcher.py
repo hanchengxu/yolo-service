@@ -24,6 +24,10 @@
 
     # 把判定区画出来存图，肉眼确认 zone 框得对不对
     python seat_watcher.py --image test.png --once --draw zone.png
+
+    # 服务器后台跑：日志同时进文件（滚动），并每 60 秒打一行心跳
+    nohup python seat_watcher.py --log-file logs/seat.log > /dev/null 2>&1 &
+    tail -f logs/seat.log
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -63,7 +68,22 @@ DEFAULTS = {
         "hold_minutes": 20,
         "interval": 1.0,
     },
-    "ha": {"url": "", "token": "", "entity_id": "binary_sensor.dining_seat_occupied"},
+    "ha": {
+        "enabled": False,
+        "url": "",
+        "token": "",
+        "entity_id": "binary_sensor.dining_seat_occupied",
+        "light_on_script": "script.open_work_light",
+        "light_off_script": "script.close_work_light",
+    },
+    # 日志：服务器上靠它确认「服务活着 / 状态对不对」
+    "logging": {
+        "level": "info",  # debug 会打印每帧明细
+        "file": "logs/seat_watcher.log",  # 相对路径基于脚本所在目录；空=只打控制台
+        "max_bytes": 5 * 1024 * 1024,  # 单文件上限，超出滚动
+        "backups": 3,  # 保留几个历史文件
+        "heartbeat_sec": 60,  # 心跳间隔（秒），0=关闭
+    },
 }
 
 log = logging.getLogger("seat")
@@ -97,6 +117,66 @@ def load_config(path: Path | None) -> dict:
     if not isinstance(data, dict):
         raise SystemExit(f"配置文件必须是键值结构：{path}")
     return deep_merge(cfg, data)
+
+
+# ------------------------------ 日志 ------------------------------
+def fmt_dur(td) -> str:
+    """把时间差格式化成 1h23m / 4m05s / 12s，日志里好读。"""
+    if td is None:
+        return "-"
+    sec = int(td.total_seconds())
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def setup_logging(cfg: dict, verbose: bool) -> None:
+    """控制台 + 滚动文件双输出。服务器上主要靠文件确认状态。
+
+    日志时间直接用系统时区（服务器已设为 JST），无需额外转换。
+    """
+    level_name = str(cfg.get("level", "info")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    if verbose:
+        level = logging.DEBUG
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+    rel = (cfg.get("file") or "").strip()
+    if not rel:
+        log.debug("未配置日志文件，只输出控制台")
+        return
+    path = Path(rel)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=int(cfg.get("max_bytes") or 5 * 1024 * 1024),
+        backupCount=int(cfg.get("backups") or 3),
+        encoding="utf-8",
+    )
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+    log.info(
+        "日志文件：%s（等级 %s，单文件 %d MB，保留 %d 个）",
+        path,
+        logging.getLevelName(level),
+        int(cfg.get("max_bytes") or 5 * 1024 * 1024) // 1024 // 1024,
+        int(cfg.get("backups") or 3),
+    )
 
 
 # ------------------------------ 抓帧 ------------------------------
@@ -239,6 +319,15 @@ class Occupancy:
         self.hit_streak = 0
         self.miss_streak = 0
         self.last_confirm: datetime | None = None
+        self.state_since = datetime.now()  # 当前状态从什么时候开始
+        self.prev_state_span: timedelta | None = None  # 上一段状态持续了多久
+        self.changes = 0
+
+    def _flip(self, now: datetime) -> str:
+        self.prev_state_span = now - self.state_since
+        self.state_since = now
+        self.changes += 1
+        return "on" if self.occupied else "off"
 
     def update(self, hit: bool) -> str | None:
         """返回 'on' / 'off' 表示状态发生变化，None 表示无变化。"""
@@ -249,24 +338,28 @@ class Occupancy:
             self.last_confirm = now
             if not self.occupied and self.hit_streak >= self.hit_needed:
                 self.occupied = True
-                return "on"
+                return self._flip(now)
         else:
             self.miss_streak += 1
             self.hit_streak = 0
             if self.occupied and self.miss_streak >= self.miss_needed:
                 self.occupied = False
-                return "off"
+                return self._flip(now)
 
         # 兜底：长时间没有任何确认，强制释放（防止状态卡死）
         if self.occupied and self.last_confirm and now - self.last_confirm > self.hold:
             self.occupied = False
             log.warning("超过 %s 没有新的确认，兜底释放", self.hold)
-            return "off"
+            return self._flip(now)
         return None
 
 
 # ------------------------------ HA 上报 ------------------------------
 def push_ha(cfg: dict, state: str, attrs: dict, dry_run: bool) -> None:
+    if not cfg.get("enabled", True):
+        log.info("[HA 已关闭] 本应写入 %s = %s", cfg.get("entity_id"), state)
+        return
+
     url = cfg.get("url", "").rstrip("/")
     token = cfg.get("token") or os.environ.get("HA_TOKEN", "")
     entity = cfg.get("entity_id", "binary_sensor.dining_seat_occupied")
@@ -301,6 +394,50 @@ def push_ha(cfg: dict, state: str, attrs: dict, dry_run: bool) -> None:
         )
     except Exception as exc:
         log.error("上报 HA 失败：%s", exc)
+
+
+def ha_auth(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def call_ha_script(cfg: dict, script_entity_id: str, dry_run: bool) -> None:
+    """调用 HA 脚本（entity_id 形如 script.open_work_light）。"""
+    if not cfg.get("enabled", True):
+        log.info("[HA 已关闭] 本应执行脚本 %s", script_entity_id)
+        return
+    if not script_entity_id:
+        return
+
+    url = cfg.get("url", "").rstrip("/")
+    token = cfg.get("token") or os.environ.get("HA_TOKEN", "")
+    if dry_run:
+        log.info("[dry-run] 将执行 HA 脚本 %s", script_entity_id)
+        return
+    if not url or not token:
+        log.warning("未配置 HA（url/token 为空），跳过脚本 %s", script_entity_id)
+        return
+
+    endpoint = f"{url}/api/services/script/turn_on"
+    payload = json.dumps({"entity_id": script_entity_id}).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint, data=payload, headers=ha_auth(token), method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        log.info("已调用 HA 脚本 %s", script_entity_id)
+    except urllib.error.HTTPError as exc:
+        log.error(
+            "HA 脚本 %s 返回 %s：%s",
+            script_entity_id,
+            exc.code,
+            exc.read().decode("utf-8", "replace")[:200],
+        )
+    except Exception as exc:
+        log.error("调用 HA 脚本 %s 失败：%s", script_entity_id, exc)
 
 
 # ------------------------------ 可视化 ------------------------------
@@ -371,19 +508,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--conf", type=float, help="覆盖配置里的置信度阈值")
     ap.add_argument("--zone", help="覆盖配置里的座位区，格式 x1,y1,x2,y2（归一化）")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印每次检测的明细")
+    ap.add_argument("--log-file", help="覆盖配置里的日志文件路径；空字符串=只打控制台")
+    ap.add_argument(
+        "--heartbeat", type=float, help="覆盖配置里的心跳间隔（秒），0=关闭"
+    )
     return ap
 
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     cfg = load_config(args.config if args.config.is_file() else None)
+
+    lcfg = cfg["logging"]
+    if args.log_file is not None:
+        lcfg["file"] = args.log_file
+    if args.heartbeat is not None:
+        lcfg["heartbeat_sec"] = args.heartbeat
+    setup_logging(lcfg, args.verbose)
 
     mcfg, zcfg, dcfg, hacfg = cfg["model"], cfg["zone"], cfg["debounce"], cfg["ha"]
     if args.conf is not None:
@@ -396,12 +538,27 @@ def main(argv: list[str]) -> int:
     if len(zcfg["rect"]) != 4:
         raise SystemExit("zone.rect 必须是 4 个数：[x1, y1, x2, y2]")
 
+    log.info("=" * 60)
+    log.info(
+        "seat-watcher 启动 | pid=%d | 抓帧=%s | 模型=%s(%s)",
+        os.getpid(),
+        cfg["source"]["url"],
+        mcfg["path"],
+        mcfg["device"],
+    )
     log.info(
         "座位区 zone=%s，框高上限=%.0f%%，置信度=%.2f",
         zcfg["rect"],
         zcfg["max_box_h_pct"] * 100,
         mcfg["conf"],
     )
+    log.info(
+        "HA 上报：%s",
+        "开 -> " + str(hacfg.get("entity_id"))
+        if hacfg.get("enabled")
+        else "关（只看日志）",
+    )
+    log.info("=" * 60)
 
     detector = SeatDetector(
         mcfg["path"],
@@ -422,6 +579,19 @@ def main(argv: list[str]) -> int:
 
     if args.once:
         hit, kept, dropped = detector.detect(first)
+        log.info(
+            "单次检测：命中 %d / 排除 %d -> %s%s",
+            len(kept),
+            len(dropped),
+            "【在座】" if hit else "【空座】",
+            ""
+            if not kept
+            else f"（最高置信度 {kept[0]['conf']:.3f}，中心 {kept[0]['center']}，框高占 {kept[0]['box_h_pct']:.0%}）",
+        )
+        for d in dropped:
+            log.debug(
+                "  排除 conf=%.3f 中心=%s -> %s", d["conf"], d["center"], d.get("reason")
+            )
         print("\n" + "=" * 60)
         print(
             f"图片        : {args.image or cfg['source']['url']}  {first.shape[1]}x{first.shape[0]}"
@@ -445,13 +615,20 @@ def main(argv: list[str]) -> int:
         int(dcfg["hit_needed"]), int(dcfg["miss_needed"]), int(dcfg["hold_minutes"])
     )
     interval = float(dcfg["interval"])
+    beat_sec = float(lcfg.get("heartbeat_sec") or 0)
     log.info(
-        "开始常驻检测，间隔 %.1fs（hit>=%d 置为在座，miss>=%d 释放，兜底 %d 分钟）",
+        "开始常驻检测，间隔 %.1fs（连续命中 %d 次=在座，连续未命中 %d 次=离开，兜底 %d 分钟，心跳 %s）",
         interval,
         occ.hit_needed,
         occ.miss_needed,
         int(dcfg["hold_minutes"]),
+        f"{int(beat_sec)}s" if beat_sec > 0 else "关",
     )
+
+    started = time.monotonic()
+    frames = errors = cost_sum = 0
+    last_conf = 0.0
+    next_beat = time.monotonic() + beat_sec if beat_sec > 0 else None
 
     while True:
         try:
@@ -463,6 +640,14 @@ def main(argv: list[str]) -> int:
             t0 = time.perf_counter()
             hit, kept, dropped = detector.detect(img)
             cost = (time.perf_counter() - t0) * 1000
+
+            frames += 1
+            cost_sum += cost
+            if kept:
+                last_conf = kept[0]["conf"]
+            if errors:
+                log.info("抓帧/推理已恢复正常（之前连续失败 %d 次）", errors)
+                errors = 0
 
             if args.verbose:
                 log.debug(
@@ -479,11 +664,23 @@ def main(argv: list[str]) -> int:
             changed = occ.update(hit)
             if changed:
                 log.info(
-                    "状态变化 -> %s（命中 %d 次 / 未命中 %d 次）",
-                    changed,
+                    "★ 状态变化 -> %s（%s）：上一段持续 %s，命中 %d 次 / 未命中 %d 次，置信度 %.2f",
+                    changed.upper(),
+                    "人来了" if changed == "on" else "人走了",
+                    fmt_dur(occ.prev_state_span),
                     occ.hit_streak,
                     occ.miss_streak,
+                    last_conf,
                 )
+                # 调 HA 开关灯脚本：人来了开灯 / 人走了关灯
+                script = (
+                    hacfg.get("light_on_script")
+                    if changed == "on"
+                    else hacfg.get("light_off_script")
+                )
+                if script:
+                    call_ha_script(hacfg, script, args.dry_run)
+
                 push_ha(
                     hacfg,
                     changed,
@@ -497,11 +694,45 @@ def main(argv: list[str]) -> int:
                     args.dry_run,
                 )
 
+            if next_beat and time.monotonic() >= next_beat:
+                log.info(
+                    "心跳 | 状态=%s（已持续 %s，累计变化 %d 次）| 帧数=%d 失败=%d | "
+                    "平均耗时=%.0fms | 连续命中=%d 连续未命中=%d | 最近置信度=%.2f | 已运行 %s",
+                    "在座" if occ.occupied else "空座",
+                    fmt_dur(datetime.now() - occ.state_since),
+                    occ.changes,
+                    frames,
+                    errors,
+                    cost_sum / frames if frames else 0,
+                    occ.hit_streak,
+                    occ.miss_streak,
+                    last_conf,
+                    fmt_dur(timedelta(seconds=int(time.monotonic() - started))),
+                )
+                next_beat = time.monotonic() + beat_sec
+
         except KeyboardInterrupt:
-            log.info("已停止")
+            log.info(
+                "已停止 | 共处理 %d 帧，失败 %d 次，状态变化 %d 次，运行 %s",
+                frames,
+                errors,
+                occ.changes,
+                fmt_dur(timedelta(seconds=int(time.monotonic() - started))),
+            )
             return 0
         except Exception as exc:
-            log.warning("本轮失败，跳过：%s: %s", type(exc).__name__, exc)
+            errors += 1
+            # 持续失败时不要每帧刷屏：第 1 次报，之后每 30 次报一次
+            if errors == 1 or errors % 30 == 0:
+                log.warning(
+                    "连续第 %d 次失败（%s）：%s: %s",
+                    errors,
+                    cfg["source"]["url"],
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                log.debug("本轮失败，跳过：%s: %s", type(exc).__name__, exc)
 
         time.sleep(interval)
 

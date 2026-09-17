@@ -1,0 +1,22 @@
+[Unit]
+Description=餐厅座位占用检测（seat-watcher，YOLOv8 + OpenVINO）
+After=network.target go2rtc.service
+Wants=go2rtc.service
+
+[Service]
+User=root
+WorkingDirectory=/root/yolo_env
+Environment=PATH=/root/yolo_env/bin:/usr/bin:/bin
+ExecStart=/root/yolo_env/bin/python seat_watcher.py
+
+# 崩溃/异常退出都自动重启；每次重启会重新做 5 秒 GPU 预热（正常）
+Restart=always
+RestartSec=5
+
+# 日志：journald + 应用自己的文件日志(logs/seat_watcher.log) 双份
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=seat-watcher
+
+[Install]
+WantedBy=multi-user.target

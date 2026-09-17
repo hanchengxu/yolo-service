@@ -211,6 +211,41 @@ pip install ultralytics openvino pyyaml opencv-python
 yolo export model=yolov8s.pt format=openvino half=True
 ```
 
+### 6.4 常驻运行（systemd，推荐）
+
+把 seat-watcher 注册成系统服务：**开机自启 + 崩溃自动重启 + 日志进 journald**。
+现在 `ha.enabled: false`，先只写日志不推 HA，确认判定无误再开。
+
+> `seat-watcher.service` 里的 `User` / `WorkingDirectory` / `ExecStart` 路径要按实际改；
+> **`WorkingDirectory` 必须是 `seat_watcher.py` 所在目录**（配置里的相对路径都基于它解析）。
+
+```bash
+sudo cp seat-watcher.service /etc/systemd/system/
+sudo vi /etc/systemd/system/seat-watcher.service   # 确认路径
+sudo systemctl daemon-reload
+sudo systemctl enable --now seat-watcher           # 启用并立即启动
+```
+
+日常管理：
+
+```bash
+sudo systemctl status seat-watcher     # 运行状态
+sudo systemctl start   seat-watcher    # 启动
+sudo systemctl stop    seat-watcher    # 停止
+sudo systemctl restart seat-watcher    # 改了配置后重启
+sudo journalctl -u seat-watcher -f     # 实时看日志（journald）
+tail -f /root/yolo_env/logs/seat_watcher.log   # 或直接看应用自己的日志文件
+```
+
+> 没用 systemd、而是 `nohup ... &` 手动跑的，就用 `pkill -f seat_watcher.py` 停、`nohup ... &` 起，别用 systemctl。
+
+#### 日志时间
+
+日志时间直接用**系统时区**。服务器时区设为 `Asia/Tokyo`（JST）后，日志就是日本时间，
+无需在配置里额外指定（`timedatectl set-timezone Asia/Tokyo` 即可，见 §6.4 前序）。
+
+```
+
 ---
 
 ## 7. 使用
@@ -227,6 +262,9 @@ python seat_watcher.py --image /tmp/t.jpg --once
 
 # 画区域图：黄=座位区，绿=判定在座，红=被排除（标原因）
 python seat_watcher.py --image /tmp/t.jpg --once --draw /tmp/zone.png
+
+
+python3 seat_watcher.py --once --draw ./zone.png
 ```
 
 ### 常驻运行
@@ -298,7 +336,7 @@ python snap_test.py --image t.jpg --zone 0.62,0.44,0.88,0.84 --device intel:gpu
 
 ### 近期
 
-- [ ] systemd 常驻：开机自启 + `Restart=always` + 启动时从 HA 读回状态（避免重启瞬间闪断）
+- [x] systemd 常驻：开机自启 + `Restart=always`（见 §6.4 `seat-watcher.service`）
 - [ ] 空座位负样本验证（必须判定【空座】）
 - [ ] 多时段验证：白天 / 傍晚开灯 / **深夜红外** / 阴天
 
